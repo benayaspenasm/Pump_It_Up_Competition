@@ -1,0 +1,2089 @@
+---
+title: "Pump It Up. Data Mining The Water Table"
+author: "Miguel Benayas Penas"
+date: "Septiembre 2021"
+output:
+  html_document:
+    df_print: paged
+    toc_depth: 3
+    number_sections: true 
+    theme: yeti
+    highlight: tango
+    code_folding: hide
+    fig_width: 9
+    fig_height: 7
+    toc: true
+    toc_float:
+      collapsed: true
+      smooth_scroll: false
+      
+---
+<style>
+body { 
+text-align: justify}
+</style>
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(eval = FALSE)
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+
+# - Consideraciones previas
+
+Siguiendo lo que marca el archivo "00 Guia_de_Estudio_Aplicaciones_BigData_en_Empresa.pdf", voy a asumir que estoy trabajando como Data Scientist en una empresa X y que el jefe del departamento me ha pedido un primer informe para predecir el estado de los acuíferos, en base a los inputs proporcionados en el sitio web.
+
+Por tanto, en lo que resta de archivo, se asume que el destinatario está familiarizado con la Ciencia de Datos. Esto desemboca que la naturaleza del documento deba de ser de carácter técnico.
+
+En aras a una mayor legibilidad, otro objetivo de este módulo del máster, solo se mostrarán los  outputs de los dos mejores modelos junto con un representante de cross validaton con caret. Los otros modelos (con su respectivo código) se mencionarán y se pasará rápido a las conclusiones. Esto evita al lector perderse en un maremágnum de tablas y gráficos.
+
+Como nota final, todo este trabajo lo he realizado yo solo sin haber consultado nada de la solución proporcionada por el ganador del concurso, allá en julio. Por tanto, toda parecido - si hubiera -  es fruto de la casualidad.
+
+Una vez esbozado la motivación de este archivo, comenzamos.
+
+
+
+# - Objetivo
+
+
+Primera aproximación en la resolución de un problema de clasificación sobre el estado de las bombas en acuíferos (waterpoints) mediante un método iterativo. La variable objetivo presenta tres categorías, es decir, se trata de una clasificación multinomial. 
+
+Al tratarse de una clasificación no binaria, se usará accuracy como métrica de bondad en vez de ROC.
+
+El problema consta de dos conjuntos. Hay un train con el que se entrenarán y validarán los modelos y un conjunto test con el que se calificará a los mejores modelos candidatos. Como aclaración, se entenderá por modelo a la combinación de 1) conjunto de variables inputs, 2) sus transformaciones, 3) algoritmo con su configuración particular de hiperparámetros y 4) técnica de remuestreo usada.
+
+La tipología de este problema condiciona los algoritmos a evaluar. Tres algoritmos han sido empleados para esta primera toma de contacto con el problema: random forest (en su instancia ranger) y boosting (gbm y xgboost).
+
+
+Debido a las limitaciones de fecha límite y capacidad computacional, no se podrá hacer una búsqueda exhaustiva de modelos. Es por tanto que el presente documento se basa en el paradigma de ramificación y poda a lo largo de las iteraciones.
+
+# - Obtención de modelos
+
+Se cargan los paquetes a usar y se empieza con la primera iteración.
+
+```{r cargo, message=FALSE, warning=FALSE, layout="l-body", eval=TRUE}
+#-----------------------------------------
+# Library loading
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(caret)
+  library(scales)
+  library(ggplot2)
+  library(stringi)
+  library(stringr)
+  library(dataPreparation)
+  library(knitr)
+  library(kableExtra)
+  library(ggpubr)
+  library(tictoc)
+  library(ggeasy)
+  library(lubridate)
+  library(inspectdf)
+  library(Rcpp) 
+  library(car) # recode
+  library(questionr ) # freq
+  library(gbm)
+  library(ranger)
+  library(xgboost)
+})
+
+```
+
+
+
+## - Iteración 1
+
+En esta primera iteración no se prioriza el optimizar sino el explorar y limpiar el dataset, para así ganar una primera intuición de qué variables y sus transformaciones pueden ser más influyentes.
+
+### - Data Loading
+
+Se cargan las todas variables del training set, junto con las variables input del test. 
+
+```{r datosdentro, message=FALSE, warning=FALSE, layout="l-body", eval=TRUE}
+
+datIn_x <- fread( file = 'Training_set_values.csv', nThread = 2)
+
+datIn_y <- fread( file = 'Training_set_labels.csv', nThread = 2)
+
+predict_x <- fread( file = 'Test_set_values.csv', nThread = 2)
+
+```
+
+
+### - Data Cleaning
+
+
+Mínima limpieza, en sucesivos modelos se harán cambios más profundos, así se reduce la posibilidad de sesgar todos los futuros modelos, basados en este conjunto de variables.
+
+
+Se convierten los ficheros importados en data frames. Se comprueba si hay observaciones duplicadas. Se comprueba que, en efecto, hay el mismo número de columnas en los dataset que el estipulado en la descripción del problema. Se elimina las columnas id al no aportar información.
+
+```{r dc1, message=FALSE, warning=FALSE, layout="l-body", eval=TRUE}
+
+datIn_x <- as.data.frame(datIn_x)
+datIn_y <- as.data.frame(datIn_y)
+predict_x <- as.data.frame(predict_x)
+
+cat("Número de duplicados en los predictores:", sum(duplicated(datIn_x)),'\n')
+
+cat("Número de duplicados en las etiquetas:", sum(duplicated(datIn_y)),'\n')
+
+cat("El número de predictores es de:",ncol(datIn_x),'\n')
+
+
+datIn_x$id <- NULL
+datIn_y$id <- NULL
+
+# Antes de borrar, se guardan las id a predecir
+
+test_id <- predict_x$id
+
+predict_x$id <- NULL
+
+datIn <- cbind(datIn_x,datIn_y)
+
+
+```
+
+Comprobación de si los datos están correctamente formateados.
+
+```{r dc2, message=FALSE, warning=FALSE, layout="l-body", eval=TRUE}
+
+ str(datIn)
+
+```
+
+Se efectúan copias del train y test, datMod y predict_x, sobre los que se aplicarán los cambios. Se eliminan las variables originales de las que se derivan las transformadas para reducir el riesgo de alta correlación/asociación de variables y con ello el sobreajuste.
+
+
+La variable date_recorded ha sido correctamente asignada con el tipo Date. Aunque se intuye que tiene demasiadas categorías, y habrá que transformala.
+
+Tres variables han sido incorrectamente asignadas como tipo int. 
+
+Dos variables han sido interpretadas como valores lógicos, se procederá a cambiarlas por caracteres.
+
+Se cambia el tipo de la variable objetivo (status_group) por factor.
+
+
+
+```{r dc3, message=FALSE, warning=FALSE, layout="l-body", eval=TRUE}
+
+datMod <- copy(datIn)
+
+
+datMod$region_code <- as.character(datMod$region_code)
+datMod$district_code <- as.character(datMod$district_code)
+datMod$construction_year <- as.character(datMod$construction_year)
+datMod$permit <- as.character(as.integer(datMod$permit))
+datMod$public_meeting <- as.character(as.integer(datMod$public_meeting))
+
+
+predict_x$region_code <- as.character(predict_x$region_code)
+predict_x$district_code <- as.character(predict_x$district_code)
+predict_x$construction_year <- as.character(predict_x$construction_year)
+predict_x$permit <- as.character(as.integer(predict_x$permit))
+predict_x$public_meeting <- as.character(as.integer(predict_x$public_meeting))
+
+
+
+datMod$status_group <-  as.factor(datMod$status_group)       
+
+
+str(datMod)
+
+```
+
+
+###  - EDA
+
+
+
+```{r , eval=TRUE}
+# categorical plot
+x <- inspect_cat(datMod) 
+show_plot(x)
+
+# correlations in numeric columns
+x <- inspect_cor(datMod)
+show_plot(x)
+
+# feature imbalance bar plot
+x <- inspect_imb(datMod)
+show_plot(x)
+
+# memory usage barplot
+x <- inspect_mem(datMod)
+show_plot(x)
+
+# missingness barplot
+x <- inspect_na(datMod)
+show_plot(x)
+
+# histograms for numeric columns
+x <- inspect_num(datMod)
+show_plot(x)
+
+# barplot of column types
+x <- inspect_types(datMod)
+show_plot(x)
+```
+
+Las clases están desbalanceadas en la variable objetivo, stratifiedKfolds es recomendable para reducir el overfitting.
+
+```{r eda 12}
+freq(datMod$status_group)
+```
+
+
+Presencia de missings en dos variables , permit y public_meeting, ambas variables categóricas. Se procede a su recategorización por 'Desconocido', al tener una frecuencia mayor de 5%. 
+
+
+``` {r eda2 , eval=TRUE}
+
+datMod$fe_permit<-car::recode(datMod$permit,"NA='Desconocido'")
+datMod$fe_public_meeting<-car::recode(datMod$public_meeting,"NA='Desconocido'")
+datMod$permit <- NULL
+datMod$public_meeting <- NULL
+
+
+predict_x$fe_permit<-car::recode(predict_x$permit,"NA='Desconocido'")
+predict_x$fe_public_meeting<-car::recode(predict_x$public_meeting,"NA='Desconocido'")
+predict_x$permit <- NULL
+predict_x$public_meeting <- NULL
+
+
+```
+
+De este primer EDA se extraen las siguientes conclusiones:
+
+- Predominio de variables categóricas. Por tanto, es posible que modelos basados en árboles den accuracies altas, dado el tipo de superficie de predicción que presentan.
+
+- Variables cuantitativas no tienen unas correlaciones con valores absolutos por encima de 0.95, reduciendo así el riesgo de overfitting. A simple vista, no parecen tener valores fuera de rango.
+
+- Algunas variables tienen frecuencias muy desbalancedas o pequeñas  que pueden dar lugar a overfitting y altos costes computacionales.
+
+- La variable population figura como int, así que viene redondeada en el data set, omitiendo efectos de segundo orden (decimales).
+
+
+El EDA sirve además para realizar los siguientes cambios:
+
+
+- La variable numprivate es llamativa al carecer de definición y tener casi todos los valores nulos, como indica el barplot. Se prescindirá al no aportar información. Lo mismo ocurre para la variable recorded_by.
+
+``` {r eda1 , eval=TRUE}
+
+
+freq(datMod$num_private)    
+freq(datMod$recorded_by)
+
+datMod$num_private <- NULL
+datMod$recorded_by <- NULL
+predict_x$num_private <- NULL
+predict_x$recorded_by <- NULL
+```
+
+- Se evalúa si amount_tsh  y population presentan menos de 10 categorías. De ser así, se cambiaría su tipo a categórica. Se analizan sus valores.
+
+
+    + Variable amount_tsh: ¿Es plausible que un 70% de los acuíferos estén secos? Sí, el hecho de haber acuíferos registrados desde los años 60 junto con la desertización climática más el  aumento de población mundial podrían dar lugar a esta situación. Por tanto, no se transformará esta variable para este primer EDA.
+
+    + Variable population: ¿Puede estar deshabitada la zona próxima en un 36% de los acuíferos? Sí, por lo que en consonancia con la política de mínimas transformaciones para esta primera iteración, no se modifica esta variable.
+
+
+- Se confirma que longitude tiene más de 10 valores, lo cual el histograma del EDA daba lugar a dudas.
+
+
+- Por otro lado, el valor 0 para la construction_year, sí que parece estar mal. Se asume como missing, cuya frecuencia es 34.9%. Se formará la categoría 'Desconocido' para estos datos faltantes.
+
+
+```{r eda3}
+
+freq(datMod$amount_tsh, sort = 'dec')
+freq(datMod$population, sort = 'dec')
+freq(datMod$longitude, sort = 'dec')
+freq(datMod$construction_year, sort = 'dec')
+```
+
+```{r eda4, eval=TRUE}
+datMod$fe_construction_year<-car::recode(datMod$construction_year,"0='Desconocido'")
+datMod$construction_year <- NULL
+freq(datMod$fe_construction_year, sort = 'dec')
+
+predict_x$fe_construction_year<-car::recode(predict_x$construction_year,"0='Desconocido'")
+predict_x$construction_year <- NULL
+
+```
+
+
+
+
+### - Feature engineering
+
+
+Lo mínimo indispensable en esta primera optimización. Además, al emplear modelos basados en árboles, no se estandarizarán las variables numéricas.
+
+
+La variable date_recorded presenta multitud de categorías que 1) aumentan tiempo de computación y 2) incrementan el riesgo de overfitting. Se crearán nuevas variables a partir de ella y se luego se eliminará.
+
+```{r featureeng, eval=TRUE}
+datMod$fe_anio    <- year(datMod$date_recorded)
+datMod$fe_mes     <- month(datMod$date_recorded)
+datMod$fe_dianum  <- day(datMod$date_recorded)
+datMod$fe_diasem  <- wday(datMod$date_recorded, label = TRUE, abbr = TRUE)
+datMod$date_recorded <- NULL
+
+predict_x$fe_anio    <- year(predict_x$date_recorded)
+predict_x$fe_mes     <- month(predict_x$date_recorded)
+predict_x$fe_dianum  <- day(predict_x$date_recorded)
+predict_x$fe_diasem  <- wday(predict_x$date_recorded, label = TRUE, abbr = TRUE)
+predict_x$date_recorded <- NULL
+
+```
+
+Hay otras variables categóricas que presentan muchas categorías, como se puede observar en el EDA y en la siguiente tabla. Se les aplicará una codificación (transformación) lumping a aquellas con mayor número de categorías.
+
+```{r featureeng2, eval=TRUE}
+
+freq.input.cat <- sapply(Filter(is.character, datMod),function(x) length(unique(x))) 
+
+freq.input.cat <- sort(freq.input.cat, decreasing = TRUE)
+
+kable(freq.input.cat)
+
+```
+
+
+Se hace lumping a las 6 primeras variables, las cuales presentan miles de categorías. Para esas 6 variables, se agrupan aquellas categorías con menos de un 5% de frecuencia. Si no hay ninguna categoría mayor de 5%, se elimina la variable. Obviamente todas estas transformaciones que se aplican al train se deben de efectuarse también en el test.
+
+La variable wpt_name pasa a tener dos categorías, 'named' o 'none'. Se comprueba que ambos datasets tienen frecuencias muy parecidas, indicando (de forma no suficiente) que pueden venir ambos de una misma muestra.
+
+
+
+```{r featureeng3, eval=TRUE}
+
+freq(datMod$wpt_name, sort = 'dec')
+
+# categorías exceptuando 'none'
+wpt.name.labels <- unique(datMod$wpt_name)
+wpt.name.labels <- wpt.name.labels[!(wpt.name.labels %in% 'none')]
+
+datMod$fe_wpt_name <-car::recode(datMod$wpt_name, "wpt.name.labels = 'named'")
+datMod$wpt_name <- NULL
+
+# repito etiquetqas por que hay resíduos no contemplados en train
+wpt.name.labels <- unique(predict_x$wpt_name)
+wpt.name.labels <- wpt.name.labels[!(wpt.name.labels %in% 'none')]
+predict_x$fe_wpt_name <-car::recode(predict_x$wpt_name, "wpt.name.labels = 'named'")
+predict_x$wpt_name <- NULL
+
+freq(datMod$fe_wpt_name, sort = 'dec')
+freq(predict_x$fe_wpt_name, sort = 'dec')
+
+```
+
+Se elimina la categoría subvillage por no tener ninguna frecuencia superior al 5%.
+
+```{r featureeng4, eval=TRUE}
+
+freq(datMod$subvillage, sort = 'dec')
+datMod$subvillage <- NULL
+predict_x$subvillage <- NULL
+
+```
+
+Se pasó por alto el gran número de missings en scheme_name. Al no suponer más del 50% se renombrarán como 'Desconocido' y a las demás se agruparán como 'Conocido'. De nuevo, training y set tienen frecuencias similares tras renombrar.
+
+```{r featureeng5, eval=TRUE}
+
+freq(datMod$scheme_name, sort = 'dec')
+
+scheme_name.labels <- unique(datMod$scheme_name)
+scheme_name.labels <- scheme_name.labels[!(scheme_name.labels %in% "")]
+datMod$fe_scheme_name <-car::recode(datMod$scheme_name, "scheme_name.labels = 'Conocido'")
+datMod$fe_scheme_name <-car::recode(datMod$fe_scheme_name, "'' = 'Desconocido'")
+datMod$scheme_name <- NULL
+
+scheme_name.labels <- unique(predict_x$scheme_name)
+scheme_name.labels <- scheme_name.labels[!(scheme_name.labels %in% "")]
+predict_x$fe_scheme_name <-car::recode(predict_x$scheme_name, "scheme_name.labels = 'Conocido'")
+predict_x$fe_scheme_name <-car::recode(predict_x$fe_scheme_name, "'' = 'Desconocido'")
+predict_x$scheme_name <- NULL
+
+
+freq(datMod$fe_scheme_name, sort = 'dec')
+freq(predict_x$fe_scheme_name, sort = 'dec')
+```
+
+Agrupamos en 'Otros' en la variable installer y renombramos los missings no detectados anteriormente al pasar de 5%.
+
+```{r featureeng6, eval=TRUE}
+
+freq(datMod$installer, sort = 'dec')
+
+installer.labels <- unique(datMod$installer)
+installer.labels <- installer.labels[!(installer.labels %in% c('','DWE'))]
+datMod$fe_installer <-car::recode(datMod$installer, "installer.labels = 'Otros'")
+datMod$fe_installer <-car::recode(datMod$fe_installer, "'' = 'Desconocido'")
+datMod$installer <- NULL
+freq(datMod$fe_installer, sort = 'dec')
+
+installer.labels <- unique(predict_x$installer)
+installer.labels <- installer.labels[!(installer.labels %in% c('','DWE'))]
+predict_x$fe_installer <-car::recode(predict_x$installer, "installer.labels = 'Otros'")
+predict_x$fe_installer <-car::recode(predict_x$fe_installer, "'' = 'Desconocido'")
+predict_x$installer <- NULL
+freq(predict_x$fe_installer, sort = 'dec')
+
+
+```
+
+Se elimina la variable ward.
+
+```{r featureeng7, eval=TRUE}
+
+freq(datMod$ward, sort = 'dec')
+datMod$ward <- NULL
+predict_x$ward <- NULL
+```
+
+Se modifica la variable funder. De nuevo, training y test son muy parecidos en las proporciones. Como se dijo anteriormente, todas estas similitudes evidenciadas en las frecuencias son condiciones necesarias, que no suficientes, para afirmar que training y test provienen de la misma población.
+
+```{r featureeng8, eval=TRUE}
+
+freq(datMod$funder, sort = 'dec')
+
+funder.labels <- unique(datMod$funder)
+funder.labels <- funder.labels[!(funder.labels %in% c('','Government Of Tanzania','Danida'))]
+datMod$fe_funder <-car::recode(datMod$funder, "funder.labels = 'Otros'")
+datMod$fe_funder <-car::recode(datMod$fe_funder, "'' = 'Desconocido'")
+freq(datMod$fe_funder, sort = 'dec')
+datMod$funder <- NULL
+
+
+funder.labels <- unique(predict_x$funder)
+funder.labels <- funder.labels[!(funder.labels %in% c('','Government Of Tanzania','Danida'))]
+predict_x$fe_funder <-car::recode(predict_x$funder, "funder.labels = 'Otros'")
+predict_x$fe_funder <-car::recode(predict_x$fe_funder, "'' = 'Desconocido'")
+freq(predict_x$fe_funder, sort = 'dec')
+predict_x$funder <- NULL
+
+```
+
+
+### - Modelos 
+
+Se construyen modelos a partir del los inputs modificados en esta primera iteración, datMod, a evaluar en el igualmente transformado conjunto test predict_x. Los algoritmos a analizar son solo dos, ranger (random forest) y gbm (boosting) por restricciones con la fecha de entrega.
+
+Se divide datMod en un conjunto train y otro validation, siendo las proporciones 80% y 20% respectivamente tras un shuffle previo. Los modelos se entrenan con train y se evalúan con validation. Posteriormente, se probarán con el conjunto test aquellos modelos que presenten una accuracy más alta en validación.
+
+Dividir el train en dos subconjuntos tiene la desventaja de que se entrena con una población menor pero se consigue tener un muestra completamente independiente para evaluar antes de subir las predicciones al sitio web, donde solo se permite 3 soluciones al día. De no haber tal restricción no se habría establecido el conjunto validación. No obstante, dado al número alto de muestras proporcionados, quitar un 20% no tendría que suponer una fuerte penalización en cuanto a accuracy.
+
+Debido a las restricciones de deadline y capacidad computacional, se evalúan dos técnicas de remuestreo, niguna o 'none' (un solo fold) y stratifiedKfolds. El none sirve para estimar los tiempos de computación requeridos, lo cual condiciona el número de folds y repeticiones asumible. Por otro lado, al haber variables con muchas categorías, podría reducir el overfitting también en este problema en particular. No se aplica grid search en los hiperparámetros.
+
+Uso de la función de caret createDataPartition para hacer el remuestreo tipo stratifiedKfolds (5 folds) con shuffle. 
+
+En esta primera iteración no se hacen repeticiones con ningún modelo.
+
+Se empieza con un ranger, con parámetros con valores o bien por defecto o bien 'comunes', al ser usados en códigos de profesores del máster en Data Science que el autor está cursando. No hay grid search paramétrico en esta primera iteración para ningún algoritmo. 
+
+En aras de mantener una cierta consitencia, los valores de parámetros se mantendrán iguales para aquellos compartidos por los algoritmos. Obviamente, dicha consistencia no es perfecta al tratarse de distintos algoritmos. Por ejemplo, num.trees = 100 tanto para ranger como gbm.
+
+
+```{r, eval=TRUE}
+#------------------------------- TRAIN -TEST - SPLIT 
+
+library(doMC)
+library(ranger)
+library(tictoc)
+# registerDoMC(2)
+
+# Split out validation dataset
+# create a list of 80% of the rows in the original dataset we can use for training
+set.seed(1234)
+validationIndex <- createDataPartition(datMod$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test  <- datMod[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train <- datMod[validationIndex,]
+```
+
+
+
+```{r rangerdirect, eval=TRUE }
+tic()
+set.seed(1234)
+fit_r1 <- ranger(
+               status_group ~. , 
+               data = my_train,
+               num.trees = 100,
+               importance = 'impurity',
+               write.forest = TRUE,
+               min.node.size = 1,
+               splitrule = "gini",
+               verbose = TRUE,
+               classification = TRUE
+             )
+
+toc()
+
+
+```
+
+Siendo conservadores, ha tardado unos 30 segundos en ejecución. Esto da una idea de cómo de exhaustivos podemos ser ante futuras evaluaciones con cv (stratified) y grid search.
+
+
+```{r resultsmodel_1 , eval=TRUE}
+# display results
+fit_r1
+print(fit_r1)
+summary(fit_r1)
+#plot(fit_1)
+```
+
+El OOB prediction error sale 19.02 % Esto da una aproximación de lo que se puede esperar al predecir nuevos resultados, accuracies de 80%. A continuación se muestra el barplot con la importancia de variables y la accuracy del validation test.
+
+
+```{r, eval=TRUE}
+vars_imp <- fit_r1$variable.importance
+
+vars_imp <- as.data.frame(vars_imp)
+
+vars_imp$myvar <- rownames(vars_imp)
+
+
+library(ggpubr) # aunque ya estaba cargada al principio.
+ggbarplot(vars_imp[1:10,],
+          x = "myvar", y = "vars_imp",
+          #fill  = 'myvar',
+          color = "blue",             # Set bar border colors to white
+          palette = "jco",            # jco journal color palett. see ?ggpar
+          sort.val = "asc",          # Sort the value in descending order
+          sort.by.groups = FALSE,     # Don't sort inside each group
+          x.text.angle = 90,          # Rotate vertically x axis texts
+          ylab = "Importancia",
+          xlab = 'Variable', 
+          #legend.title = "MPG Group",
+          rotate = TRUE,
+          ggtheme = theme_minimal(),
+          main = "ranger con dataMod"
+          )
+```
+
+
+```{r, eval=TRUE}
+validation.fit_r1 <- predict(fit_r1, data = my_test)
+confusionMatrix( my_test$status_group, validation.fit_r1$predictions)
+
+```
+
+Una accuracy en la validación por encima del 80% (0.8103) resulta prometedor, en vista a los resultados obtenidos por los demás participantes en el concurso. **La puntuación obtenida al subir sus predicción al sitio web es de 0.8156**.
+
+```{r}
+prediction.fit_r1 <- predict(fit_r1, data = predict_x)
+
+
+file.prediction.fit_r1 <- cbind.data.frame(test_id, prediction.fit_r1$predictions)
+
+colnames(file.prediction.fit_r1) <- c("id","status_group")
+
+
+fwrite(file.prediction.fit_r1, file ="predi_fit_r1.csv",sep=)
+
+```
+
+
+A continuación se aplica stratifiedkfold para ranger, así como se evalúa gbm con los dos mismos remuestreos, de nuevo sin grid search. Es decir, se aplica al GBM un training control none y stratifiedkfold (5 particiones) con shuffle previo. Las accuracies obtenidas en validación son más bajas: 0.7586, 0.7246 y  0.6789 respectivamente. Por otra parte los errores OOB también son más bajos, sobre el 18% en vez del 19.02% del primer modelo.
+
+Parece que los modelos sufren de sobreajuste al bajar la accuracy en la validación y el OOB en el entrenamiento, al usar GBM y una técnica de remuestreo más avanzada que la simple partición train-validation. Hay que recordar que aún quedan muchas variables categóricas con categorías con bajas frecuencias. Se aplicará lumping de nuevo en las variables categóricas en la iteración 2, para ver si se puede paliar este problema de overfitting al usar kfolds.
+
+
+GBM presenta tiempos de ejecución mayores que ranger, aunque del mismo orden un x3. Por ejemplo GBM con stratified tardó 30 minutos en terminar. Las dos simulaciones de GBM dieron peores accuracies que sus homólogos en ranger.
+
+
+```{r, eval=TRUE}
+set.seed(1234)
+my_train_l <- copy(my_train)
+my_test_l <- copy(my_test)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE
+                            )
+
+rf.grid<-expand.grid( mtry =  fit_r1$mtry,              
+              splitrule  = 'gini',
+             min.node.size = fit_r1$min.node.size
+ 
+ )
+
+tic()
+set.seed(1234)
+fit_r11 <- train( 
+             status_group ~., 
+             data      = my_train_l, 
+             method    = "ranger", 
+             metric    = "Accuracy",
+             importance = 'impurity',
+             tuneGrid = rf.grid,
+             num.trees = fit_r1$num.trees,
+             trControl = trainControl,
+             verbose = TRUE
+            )
+
+toc()
+
+validation.fit_r11 <- predict(fit_r11, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_r11)
+
+varImp(fit_r11)
+
+#predictions <- predict(fit, newdata = my_test)
+#confusionMatrix( my_test$fe_arrest, predictions)
+
+```
+
+
+```{r}
+tic()
+set.seed(1234)
+my_train %>% mutate_if(is.character, as.factor) -> my_train_f
+my_test %>% mutate_if(is.character, as.factor) -> my_test_f
+
+fit_g1 <- gbm.fit(my_train_f[ c(1:27,29:39)], my_train_f$status_group,
+   distribution = "multinomial",
+     n.trees = fit_r1$num.trees,
+  interaction.depth = 2,
+  n.minobsinnode = fit_r1$min.node.size,
+  shrinkage = 0.01,
+  bag.fraction = 1,
+)
+
+toc()
+
+```
+
+
+```{r resultsmodel_g1 }
+# display results
+fit_g1
+print(fit_g1)
+summary(fit_g1)
+
+varimp_g1 <- kable(relative.influence(fit_g1, n.trees = 100)  )
+
+```
+
+
+```{r}
+my_train %>% mutate_if(is.character, as.factor) -> my_train_f
+my_test %>% mutate_if(is.character, as.factor) -> my_test_f
+
+
+validation.fit_g1 = predict.gbm(fit_g1,n.trees=100, newdata=my_test_f[ c(1:27,29:39)],type='response')
+
+p.validation.fit_g1 <- apply(validation.fit_g1, 1, which.max)
+
+validation.fit_g1 <- as.factor( colnames(validation.fit_g1)[p.validation.fit_g1])
+
+confusionMatrix( validation.fit_g1,my_test_f$status_group)
+
+```
+
+
+```{r}
+tic()
+my_train_l <- copy(my_train)
+my_test_l <- copy(my_test)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+set.seed(1234)
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                            )
+
+gbmgrid<-expand.grid(shrinkage=c(0.01),
+ n.minobsinnode=c(fit_r1$min.node.size),
+ n.trees=c(fit_r1$num.trees),
+ interaction.depth=c(2))
+
+
+
+set.seed(1234)
+fit_g11 <- train( 
+             status_group~., 
+             data      = my_train_l, 
+             method    = "gbm", 
+             metric    = "Accuracy",
+             bag.fraction=1,
+             distribution="multinomial",
+             trControl = trainControl,
+             tuneGrid=gbmgrid,
+             verbose = TRUE
+            )
+toc()
+
+
+validation.fit_g11 <- predict(fit_g11, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_g11)
+
+```
+
+```{r}
+varImp(fit_g11)
+
+```
+
+
+## - Iteración 2 
+
+La primera iteración consistió en lanzar modelos con las mínimas transformaciones posibles, para evitar excesivos overfitting y tiempos de computación. En la iteración 2 se realizan tres transformaciones extra al conjunto de variables input:
+
+- Cambiar algunas variables derivadas de la fecha a categóricas.
+
+- Tratamiento de los outliers en las variables numéricas.
+
+- Lumping en algunas variables categóricas que aún tengan categorías infrarrepresentadas .
+
+Se aplican unos límites menos agresivos que en la primera iteración, dado que el número de categorías ya ha sido reducido en la iteración 1 y el número de observaciones es bastante grande. Dicho límite es 2% tanto para recategorizar como para considerar un valor como outlier.
+
+Lo primero, se transforman algunas variables derivadas de la fecha a categóricas, ya que se presuponen valores discretos. El sufijo '2' que se añade para renombrar estas variables representa la iteración donde estas se han transformado.
+
+Los conjuntos train/test derivados de esta segunda iteración pasarán a llamarse datMod2 y predict_x2 respectivamente.
+
+```{r}
+datMod2 <- copy(datMod)
+ predict_x2 <- copy(predict_x)
+
+datMod2$fe_anio2 <- as.character(datMod2$fe_anio)     
+datMod2$fe_mes2 <- as.character(datMod2$fe_mes)         
+datMod2$fe_dianum2 <- as.character(datMod2$fe_dianum)  
+datMod2$fe_anio  <- NULL       
+datMod2$fe_mes  <- NULL           
+datMod2$fe_dianum  <- NULL 
+ 
+  predict_x2$fe_anio2 <- as.character(predict_x2$fe_anio)     
+ predict_x2$fe_mes2 <- as.character(predict_x2$fe_mes)         
+ predict_x2$fe_dianum2 <- as.character(predict_x2$fe_dianum)  
+ predict_x2$fe_anio  <- NULL       
+ predict_x2$fe_mes  <- NULL           
+ predict_x2$fe_dianum  <- NULL 
+ 
+ str(datMod2)   
+ 
+```
+
+
+```{r }
+# categorical plot
+x <- inspect_cat(datMod2) 
+show_plot(x)
+
+# correlations in numeric columns
+x <- inspect_cor(datMod2)
+show_plot(x)
+
+# feature imbalance bar plot
+x <- inspect_imb(datMod2)
+show_plot(x)
+
+# memory usage barplot
+x <- inspect_mem(datMod2)
+show_plot(x)
+
+# missingness barplot
+x <- inspect_na(datMod2)
+show_plot(x)
+
+# histograms for numeric columns
+x <- inspect_num(datMod2)
+show_plot(x)
+
+# barplot of column types
+x <- inspect_types(datMod2)
+show_plot(x)
+```
+
+### - Variables numéricas
+
+Las variables amount_tsh y population presentan algunos valores muy altos, observando la mediana y la media del conjunto train. Se comprueba si se tratan de outliers o de 'datos grandes', en función del porcentaje sobre el train.
+
+Esta comprobación también se extiende, con menor riesgo de presencia de outliers, al resto de variables numéricas.
+
+```{r}
+print("amount_tsh")
+summary(datMod2$amount_tsh)
+print("population")
+summary(datMod2$population)
+print("gps_height")
+summary(datMod2$gps_height)
+print("longitude")
+summary(datMod2$longitude)
+print("latitude")
+summary(datMod2$latitude)
+```
+
+Se crean unos boxplots estandarizados con el valor máximo, para ayudar a visualizar la proporción de posibles outliers.
+
+```{r}
+amount_tsh <- boxplot.stats(datMod2$amount_tsh)
+100*length(amount_tsh$out)/nrow(datMod2)
+
+population <- boxplot.stats(datMod2$population)
+100*length(population$out)/nrow(datMod2)
+
+gps_height <- boxplot.stats(datMod2$gps_height)
+100*length(gps_height$out)/nrow(datMod2)
+
+boxplot(datMod2$amount_tsh/max(datMod2$amount_tsh), main="boxplot amount_tsh")
+boxplot(datMod2$population/max(datMod2$population), main="boxplot populaton")
+boxplot(datMod2$gps_height/max(datMod2$gps_height), main="boxplot gps_height")
+
+```
+
+Las variables amount_tsh y population presentan una porcentaje amplio de datos grandes, mayor del 5%. Por tanto, no pueden borrarse todos directamente. Sin embargo, viendo los boxplots estandarizados, se aprecia que hay unas observaciones muy grandes que podrían perjudicar los modelos. 
+
+Por tanto, se va a evaluar cómo quedan los boxplots poniendo como NAs aquellos valores en el percentil 98% e imputando con las medianas de las variables en el train. Estos boxplots están normalizados con los valores máximos del conjunto resultate de la iteración 1, datMod.
+
+Como se mencionó anteriormente, se aplican los valores medianos del datMod2 a predict_x2 de cara a la imputación.
+
+```{r}
+upper.bound.amount_tsh <- quantile(datMod2$amount_tsh, 0.98)
+median.amount_tsh <- median(datMod2$amount_tsh, na.rm = TRUE)
+datMod2$fe_amount_tsh2 <- copy(datMod2$amount_tsh)
+datMod2$fe_amount_tsh2[datMod2$fe_amount_tsh2>upper.bound.amount_tsh] <- NA
+datMod2$fe_amount_tsh2[is.na(datMod2$fe_amount_tsh2)] <- median.amount_tsh
+boxplot(datMod2$fe_amount_tsh2/max(datMod2$amount_tsh),main="boxplot fe_amount_tsh2")
+datMod2$amount_tsh <- NULL
+
+upper.bound.population <- quantile(datMod2$population, 0.98)
+median.population <- median(datMod2$population, na.rm = TRUE)
+datMod2$fe_population2 <- copy(datMod2$population)
+datMod2$fe_population2[datMod2$fe_population2>upper.bound.population] <- NA
+datMod2$fe_population2[is.na(datMod2$fe_population2)] <- median.population
+boxplot(datMod2$fe_population2/max(datMod2$population),main="boxplot fe_populaton2")
+datMod2$population <- NULL
+
+
+predict_x2$fe_amount_tsh2 <- copy(predict_x2$amount_tsh)
+predict_x2$fe_amount_tsh2[predict_x2$fe_amount_tsh2>upper.bound.amount_tsh] <- NA
+predict_x2$fe_amount_tsh2[is.na(predict_x2$fe_amount_tsh2)] <- median.amount_tsh
+boxplot(predict_x2$fe_amount_tsh2/max(predict_x2$amount_tsh),main="boxplot fe_amount_tsh2")
+predict_x2$amount_tsh <- NULL
+
+upper.bound.population <- quantile(predict_x2$population, 0.98)
+median.population <- median(predict_x2$population, na.rm = TRUE)
+predict_x2$fe_population2 <- copy(predict_x2$population)
+predict_x2$fe_population2[predict_x2$fe_population2>upper.bound.population] <- NA
+predict_x2$fe_population2[is.na(predict_x2$fe_population2)] <- median.population
+boxplot(predict_x2$fe_population2/max(predict_x2$population),main="boxplot fe_populaton2")
+predict_x2$population <- NULL
+```
+
+Se aprecia como los datos están más compactos, comparando la escala del eje y con respecto a los boxplots anteriores.
+
+### - Variables categóricas
+
+Antes de aplicar las siguientes transformaciones, se guarda el datMod2 con el tratamiento de outliers ya realizado en una nueva variable (datMod2_num) para la iteración 3. De esta forma, se puede comparar el efecto de eliminar outliers de forma independiente.
+
+Se realiza un lumping, agrupando aquellas variables que presenten categorías con frecuencias inferiores a 2%. En este proceso se excluye la variable día del mes, fe_dianum2.
+
+```{r}
+datMod2_num <- copy(datMod2)
+predict_x2_num <- copy(predict_x2)
+
+
+# Movemos status_group a la ultima columna, aseguro que predict_x2 ydatMod2 presentan la misma enumeración, ya que las siguientes líneas lo asumen
+ status_index <- grep("status_group", names(datMod2))
+datMod2 <- cbind(datMod2[-status_index], datMod2[status_index])
+
+char.indices <- as.data.frame( which(sapply(datMod2, function(x) is.character(x)))  )
+
+char.indices <- char.indices[!char.indices %in% char.indices[rownames(char.indices) == "fe_dianum2", 1]]
+
+indices.changed <- c()
+
+for (char.indice in char.indices[,1])
+  
+{
+  
+  a <- as.data.frame(freq(datMod2[,char.indice],sort = "inc"))
+  
+  
+  indices <- a[a[,3] < 2,]
+  
+  if (nrow(indices)>0)
+  {
+    indices.changed <- append(indices.changed,char.indice )
+    
+   datMod2[,char.indice]  <-car::recode(datMod2[,char.indice], 
+                                           "rownames(indices) = 'Otros'")
+    
+    predict_x2[,char.indice]  <-car::recode(predict_x2[,char.indice], 
+                                           "rownames(indices) = 'Otros'")
+    
+  }
+  
+  
+}  
+  
+  
+library(stringr)
+
+
+for (indice.changed in indices.changed)
+  
+{
+  name <-  colnames(datMod2)[indice.changed]
+  
+  if (substr(name,1,3) != "fe_")
+    
+  {
+    name <- paste("fe_", name, sep="")
+}
+    
+if (str_sub(name, start= -1) != "2")  
+  
+{
+  name <- paste( name,"2", sep="")
+  colnames(datMod2)[indice.changed] <- name 
+  colnames(predict_x2)[indice.changed] <- name 
+}
+
+  
+}
+
+
+
+
+```
+
+Comprobación rápida del train y test, ambos conjuntos contienen el mismo número de columnas y similares proporciones. Como se esperaba, el gráfico de abajo muestra menos categorías que en la iteración 1. Es decir, está menos 'segmentado'.
+
+```{r}
+colnames(datMod2)
+colnames(predict_x2)
+
+freq(datMod2$fe_lga2)
+freq(predict_x2$fe_lga2)
+
+x <- inspect_cat(datMod2) 
+show_plot(x)
+```
+
+### - Modelos 
+
+
+Mismos algoritmos, hiperparámetros y remuestreos que la iteración 1. Solo cambian las transformaciones añadidas al train y test. Los resultados son peores en general, la accuracy en validación cae en 3 de los 4 modelos respecto a sus análogos de la iteración 1. Hay una mejora de unos tres puntos porcentuales en el caso de ranger con stratifiedKfolds.
+
+- Ranger sin remuestreo:  0.8133
+- Ranger y stratifiedKfolds: 0.79
+- GBM sin remuestreo:  0.7089
+- GBM y stratifiedKfolds: 0.6741
+
+```{r rangerdirect2 }
+        
+# Split out validation dataset
+# create a list of 80% of the rows in the original dataset we can use for training
+set.seed(1234)
+validationIndex <- createDataPartition(datMod2$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test2  <-datMod2[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train2 <-datMod2[validationIndex,]
+
+
+tic()
+set.seed(1234)
+fit_r2 <- ranger(
+               status_group ~. , 
+               data = my_train2,
+               num.trees = fit_r1$num.trees,
+               importance = 'impurity',
+               write.forest = TRUE,
+               min.node.size = fit_r1$min.node.size,
+               splitrule = "gini",
+               verbose = TRUE,
+               classification = TRUE
+             )
+
+toc()
+
+fit_r2
+print(fit_r2)
+summary(fit_r2)
+
+
+vars_imp2 <- fit_r2$variable.importance
+
+vars_imp2 <- as.data.frame(vars_imp2)
+
+vars_imp2$myvar <- rownames(vars_imp2)
+
+
+library(ggpubr) # aunque ya estaba cargada al principio.
+ggbarplot(vars_imp2[1:10,],
+          x = "myvar", y = "vars_imp2",
+          #fill  = 'myvar',
+          color = "blue",             # Set bar border colors to white
+          palette = "jco",            # jco journal color palett. see ?ggpar
+          sort.val = "asc",          # Sort the value in descending order
+          sort.by.groups = FALSE,     # Don't sort inside each group
+          x.text.angle = 90,          # Rotate vertically x axis texts
+          ylab = "Importancia",
+          xlab = 'Variable', 
+          #legend.title = "MPG Group",
+          rotate = TRUE,
+          ggtheme = theme_minimal(),
+          main = "ranger con dataMod"
+          )
+
+fit_r2
+print(fit_r2)
+summary(fit_r2)
+
+
+validation.fit_r2 <- predict(fit_r2, data = my_test2)
+confusionMatrix( my_test2$status_group, validation.fit_r2$predictions)
+
+
+
+prediction.fit_r2 <- predict(fit_r2, data = predict_x2)
+file.prediction.fit_r2 <- cbind.data.frame(test_id, prediction.fit_r2$predictions)
+colnames(file.prediction.fit_r2) <- c("id","status_group")
+fwrite(file.prediction.fit_r2, file ="predi_fit_r2.csv",sep=)
+```
+
+```{r}
+set.seed(1234)
+my_train_l <- copy(my_train2)
+my_test_l <- copy(my_test2)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE
+                            )
+
+rf.grid<-expand.grid( mtry =  fit_r1$mtry,              
+              splitrule  = 'gini',
+             min.node.size = fit_r1$min.node.size
+ 
+ )
+
+tic()
+set.seed(1234)
+fit_r21 <- train( 
+             status_group ~., 
+             data      = my_train_l, 
+             method    = "ranger", 
+             metric    = "Accuracy",
+             importance = 'impurity',
+             tuneGrid = rf.grid,
+             num.trees = fit_r1$num.trees,
+             trControl = trainControl,
+             verbose = TRUE
+            )
+
+toc()
+
+validation.fit_r21 <- predict(fit_r21, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_r21)
+
+varImp(fit_r21)
+
+#predictions <- predict(fit, newdata = my_test)
+#confusionMatrix( my_test$fe_arrest, predictions)
+
+```
+
+
+```{r}
+tic()
+set.seed(1234)
+my_train2 %>% mutate_if(is.character, as.factor) -> my_train_f
+my_test2 %>% mutate_if(is.character, as.factor) -> my_test_f
+
+fit_g2 <- gbm.fit(my_train_f[ c(1:38)], my_train_f$status_group,
+   distribution = "multinomial",
+     n.trees = fit_r1$num.trees,
+  interaction.depth = 2,
+  n.minobsinnode = fit_r1$min.node.size,
+  shrinkage = 0.01,
+  bag.fraction = 1,
+)
+
+toc()
+
+fit_g2
+print(fit_g2)
+summary(fit_g2)
+varimp_g2 <- kable(relative.influence(fit_g2, n.trees = 100)  )
+
+validation.fit_g2 = predict.gbm(fit_g2,n.trees=100, newdata=my_test_f[ c(1:38)],type='response')
+p.validation.fit_g2 <- apply(validation.fit_g2, 1, which.max)
+validation.fit_g2 <- as.factor( colnames(validation.fit_g2)[p.validation.fit_g2])
+confusionMatrix( validation.fit_g2,my_test_f$status_group)
+
+```
+
+
+
+```{r}
+my_train_l <- copy(my_train2)
+my_test_l <- copy(my_test2)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+tic()
+set.seed(1234)
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                            )
+
+gbmgrid<-expand.grid(shrinkage=c(0.01),
+ n.minobsinnode=c(fit_r1$min.node.size),
+ n.trees=c(fit_r1$num.trees),
+ interaction.depth=c(2))
+
+
+
+set.seed(1234)
+fit_g21 <- train( 
+             status_group~., 
+             data      = my_train_l, 
+             method    = "gbm", 
+             metric    = "Accuracy",
+             bag.fraction=1,
+             distribution="multinomial",
+             trControl = trainControl,
+             tuneGrid=gbmgrid,
+             verbose = TRUE
+            )
+toc()
+
+
+validation.fit_g21 <- predict(fit_g21, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_g21)
+
+```
+
+
+```{r}
+varImp(fit_g21)
+
+```
+
+
+
+
+## - Iteración 3
+
+
+Se aprovecha una copia intermedia de los conjuntos train y test de la iteración 2, datMod2_num, para evaluar resultados sin haber tratado las variables categóricas en la iteración anterior. De nuevo, mismos algoritmos, hiperparámetros y técnicas de remuestreo que en las dos iteraciones anteriores, lo único que cambian son las transformaciones realizadas a las variables numéricas originales.
+
+
+Las accuracies salen con valores intermedios respecto a los obtenidos en las iteraciones 1 y 2. Esto, mirando en retrospectiva, tiene sentido al ser una etapa intermedia entre las transformaciones aplicadas en las iteraciones 1 y 2.
+
+- Ranger sin remuestreo: 0.8063 
+- Ranger y stratifiedKfolds: 0.7627
+- GBM sin remuestreo: 0.7246 
+- GBM y stratifiedKfolds: 0.6739
+
+
+```{r rangerdirect3 }
+
+# Split out validation dataset
+# create a list of 80% of the rows in the original dataset we can use for training
+set.seed(1234)
+validationIndex <- createDataPartition(datMod2_num$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test2_num  <-datMod2_num[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train2_num <-datMod2_num[validationIndex,]
+
+
+tic()
+set.seed(1234)
+fit_r3 <- ranger(
+               status_group ~. , 
+               data = my_train2_num,
+               num.trees = 100,
+               importance = 'impurity',
+               write.forest = TRUE,
+               min.node.size = 1,
+               splitrule = "gini",
+               verbose = TRUE,
+               classification = TRUE,
+               num.threads = 2
+             )
+
+toc()
+
+
+fit_r3
+print(fit_r3)
+summary(fit_r3)
+
+
+vars_imp3 <- fit_r3$variable.importance
+
+vars_imp3 <- as.data.frame(vars_imp3)
+
+vars_imp3$myvar <- rownames(vars_imp3)
+
+
+library(ggpubr) # aunque ya estaba cargada al principio.
+ggbarplot(vars_imp3[1:10,],
+          x = "myvar", y = "vars_imp3",
+          #fill  = 'myvar',
+          color = "blue",             # Set bar border colors to white
+          palette = "jco",            # jco journal color palett. see ?ggpar
+          sort.val = "asc",          # Sort the value in descending order
+          sort.by.groups = FALSE,     # Don't sort inside each group
+          x.text.angle = 90,          # Rotate vertically x axis texts
+          ylab = "Importancia",
+          xlab = 'Variable', 
+          #legend.title = "MPG Group",
+          rotate = TRUE,
+          ggtheme = theme_minimal(),
+          main = "ranger con dataMod"
+          )
+
+fit_r3
+print(fit_r3)
+summary(fit_r3)
+
+
+validation.fit_r3 <- predict(fit_r3, data = my_test2_num)
+confusionMatrix( my_test2_num$status_group, validation.fit_r3$predictions)
+
+
+
+prediction.fit_r3 <- predict(fit_r3, data = predict_x2_num)
+file.prediction.fit_r3 <- cbind.data.frame(test_id, prediction.fit_r3$predictions)
+colnames(file.prediction.fit_r3) <- c("id","status_group")
+fwrite(file.prediction.fit_r3, file ="predi_fit_r3.csv",sep=)
+
+
+
+```
+
+
+
+```{r}
+set.seed(1234)
+my_train_l <- copy(my_train2_num )
+my_test_l <- copy(my_test2_num )
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE
+                            )
+
+rf.grid<-expand.grid( mtry =  fit_r1$mtry,              
+              splitrule  = 'gini',
+             min.node.size = fit_r1$min.node.size
+ 
+ )
+
+tic()
+set.seed(1234)
+fit_r31 <- train( 
+             status_group ~., 
+             data      = my_train_l, 
+             method    = "ranger", 
+             metric    = "Accuracy",
+             importance = 'impurity',
+             tuneGrid = rf.grid,
+             num.trees = fit_r1$num.trees,
+             trControl = trainControl,
+             verbose = TRUE
+            )
+
+toc()
+
+validation.fit_r31 <- predict(fit_r31, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_r31)
+
+varImp(fit_r31)
+
+#predictions <- predict(fit, newdata = my_test)
+#confusionMatrix( my_test$fe_arrest, predictions)
+
+```
+
+
+```{r}
+tic()
+set.seed(1234)
+my_train2_num %>% mutate_if(is.character, as.factor) -> my_train_f
+my_test2_num %>% mutate_if(is.character, as.factor) -> my_test_f
+
+fit_g3 <- gbm.fit(my_train_f[ c(1:25,27:39)], my_train_f$status_group,
+   distribution = "multinomial",
+     n.trees = fit_r1$num.trees,
+  interaction.depth = 2,
+  n.minobsinnode = fit_r1$min.node.size,
+  shrinkage = 0.01,
+  bag.fraction = 1,
+)
+
+toc()
+
+fit_g3
+print(fit_g3)
+summary(fit_g3)
+varimp_g3 <- kable(relative.influence(fit_g3, n.trees = 100)  )
+
+validation.fit_g3 = predict.gbm(fit_g3,n.trees=100, newdata=my_test_f[ c(1:25,27:39)],type='response')
+p.validation.fit_g3 <- apply(validation.fit_g3, 1, which.max)
+validation.fit_g3 <- as.factor( colnames(validation.fit_g3)[p.validation.fit_g3])
+confusionMatrix( validation.fit_g3,my_test_f$status_group)
+
+```
+
+
+```{r}
+my_train_l <- copy(my_train2_num)
+my_test_l <- copy(my_test2_num)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+tic()
+set.seed(1234)
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                            )
+
+gbmgrid<-expand.grid(shrinkage=c(0.01),
+ n.minobsinnode=c(fit_r1$min.node.size),
+ n.trees=c(fit_r1$num.trees),
+ interaction.depth=c(2))
+
+
+
+set.seed(1234)
+fit_g31 <- train( 
+             status_group~., 
+             data      = my_train_l, 
+             method    = "gbm", 
+             metric    = "Accuracy",
+             bag.fraction=1,
+             distribution="multinomial",
+             trControl = trainControl,
+             tuneGrid=gbmgrid,
+             verbose = TRUE
+            )
+toc()
+
+
+validation.fit_g31 <- predict(fit_g31, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_g31)
+
+```
+
+```{r}
+varImp(fit_g31)
+
+```
+
+
+## - Análisis de los resultados parciales y feature engineering
+
+
+Los tres conjuntos — evaluados con los mismos algoritmos, valores de los hiperparámetros y técnicas de remuestreo — dan lugar a resultados similares en términos de accuracy.
+
+En el caso de stratifiedKfolds, el esfuerzo en reducir categorías en la iteración 2 ha dado una mejor accuracy en la validación respecto a la iteración 1 en ranger, aunque ha decrecido ligeramente para GBM. No obstante, el mejor resultado ha sido con el primer modelo en la iteración 1, ranger sin remuestreo.
+
+Las variables más relevantes, aquellas que han sido usadas más veces, son por este orden:
+
+- quantity
+- waterpoint_type
+- extraction_type
+- latitude
+- longitude
+
+Las tres primeras son categóricas y las dos últimas son numéricas. Crear nuevas variables que puedan repercutir en una mejora en la accuracy no es un proceso trivial y requiere, siempre que sea posible, tiempo de una persona experta en el problema a evaluar. En este caso, se aplicará una transformación comúnmente usada para datos geográficos fe_lonlat = sqrt(latitude^2 + latitude^2) con la que se ampliarán los conjuntos.
+
+Otras transformaciones usuales son recategorizar las variables tipo fecha por estaciones, etapas del día (mañana, tarde, noche) etc. No se usarán para las siguientes iteraciones al no haber figurado como relevantes en los barplots.  
+
+
+## - Iteración 4
+
+Aprovechando que al final se ha contado con el suficiente tiempo. Se evalúan los conjuntos de las iteraciones 1, 2 y 3 con xgboost solo con stratifiedKfolds. Las accuracies obtenidas son algo mejores que gbm pero inferiores a ranger -  0.6901, 0.6808 y 0.6801 respectivamente - precisando del doble de tiempo en converger con los parámetros usados que no tienen por qué ser los óptimos. De nuevo, los valores de los hiperparámetros replican sus semejantes en los otros dos algoritmos, por ejemplo, min_child_weight=c(1) y  eta=c(0.01) 
+
+En base a los resultados obtenidos de accuracy y tiempo computacional, teniendo siempre en cuenta las limitaciones por dealine y capacidad de computación, se procederá a evaluar modelos usando exclusivamente ranger.
+
+
+```{r}
+tic()
+my_train_l <- copy(my_train)
+my_test_l <- copy(my_test)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+set.seed(1234)
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                            )
+
+xgbmgrid<-expand.grid(
+ min_child_weight=c(1),
+ eta=c(0.01),
+ nrounds=c(fit_r1$num.trees),
+ max_depth=6,gamma=0,colsample_bytree=1,subsample=1)
+
+
+
+
+set.seed(1234)
+fit_x11 <- train( 
+             status_group~., 
+             data      = my_train_l, 
+             method    = "xgbTree", 
+             metric    = "Accuracy",
+             trControl = trainControl,
+             tuneGrid=xgbmgrid,
+             verbose = FALSE
+            )
+toc()
+
+
+validation.fit_x11 <- predict(fit_x11, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_x11)
+
+varImp(fit_x11)
+
+```
+
+```{r}
+tic()
+my_train_l <- copy(my_train2)
+my_test_l <- copy(my_test2)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+set.seed(1234)
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                            )
+
+xgbmgrid<-expand.grid(
+ min_child_weight=c(1),
+ eta=c(0.01),
+ nrounds=c(fit_r1$num.trees),
+ max_depth=6,gamma=0,colsample_bytree=1,subsample=1)
+
+
+
+
+set.seed(1234)
+fit_x21 <- train( 
+             status_group~., 
+             data      = my_train_l, 
+             method    = "xgbTree", 
+             metric    = "Accuracy",
+             trControl = trainControl,
+             tuneGrid=xgbmgrid,
+             verbose = FALSE
+            )
+toc()
+
+
+validation.fit_x21 <- predict(fit_x21, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_x21)
+
+varImp(fit_x21)
+
+```
+
+```{r}
+tic()
+my_train_l <- copy(my_train2_num)
+my_test_l <- copy(my_test2_num)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+set.seed(1234)
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                            )
+
+xgbmgrid<-expand.grid(
+ min_child_weight=c(1),
+ eta=c(0.01),
+ nrounds=c(fit_r1$num.trees),
+ max_depth=6,gamma=0,colsample_bytree=1,subsample=1)
+
+
+
+
+set.seed(1234)
+fit_x31 <- train( 
+             status_group~., 
+             data      = my_train_l, 
+             method    = "xgbTree", 
+             metric    = "Accuracy",
+             trControl = trainControl,
+             tuneGrid=xgbmgrid,
+             verbose = FALSE
+            )
+toc()
+
+
+validation.fit_x31 <- predict(fit_x31, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_x31)
+
+varImp(fit_x31)
+
+```
+
+
+## - Iteración 5
+
+Se realizan dos grid searches con el conjunto de la tercera iteración, datMod2_num, ampliado con la variable anteriormente mencionanda fe_lonlat. Los parámetros a los que se le ha aplicado el mallado son mtry, min.node.size, num.trees y número de folds. Su rango de valores incluyen los originales de la iteración 1 y otros superiores - por ejemplo, min.node.size = c(fit_r1$min.node.size,10,20) - para ver si se puede reducir el overfitting. La técnica de remuestreo vuelve a ser stratifedKfolds, el segundo remuestreo se hace con repetición.
+
+
+Se usa este conjunto en vez el de la iteración 1, datMod, al haber dado mejores resultados con remuestreo para ranger.
+
+Se consiguen mejores valores de accuracy en la validación así como mayores valores de errores OOB. 0.8003/18.73 y 0.8041/18.85 respectivamente. Esto indica que se ha mejorado el problema de overfitting. Sin embargo, se sigue logrando una menor accuracy en la validación que usando ranger sin remuestro para la iteración 1, cuyo valor fue recordemos de 0.8103.   
+
+
+La mejor configuración es nodesize = 1 con los valores más altos de mtry y num.trees proporcionados, 20 y 300 respectivamente, La variable lonlat se preserva al haber sido relevante.
+
+Viendo los resultados obtenidos con  datMod2_num, se procede a hacer lo mismo en la siguiente iteración con el conjunto de la iteración 2 - nombrado como datMod2, que comprendía tratamiento de outliers más un segundo lumping - el cual ha dado los mejores resultados ha dado en validación cruzada.
+
+
+```{r}
+# Split out validation dataset
+# create a list of 80% of the rows in the original dataset we can use for training
+
+datMod3 <- copy(datMod2_num)
+
+datMod3$fe_lonlat  <- sqrt(datMod3$longitude^2 + datMod3$latitude^2)
+
+set.seed(1234)
+validationIndex <- createDataPartition(datMod$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test3  <- datMod3[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train3 <- datMod3[validationIndex,]
+
+set.seed(1234)
+my_train_l <- copy(my_train3)
+my_test_l <- copy(my_test3)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+n.folds <- 5
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE
+                            )
+
+rf.grid<-expand.grid( mtry =  c(fit_r1$mtry, 10, 15),              
+              splitrule  = 'gini',
+             min.node.size = c(fit_r1$min.node.size,10,20)
+ 
+ )
+
+tic()
+set.seed(1234)
+fit_r3 <- train( 
+             status_group ~., 
+             data      = my_train_l, 
+             method    = "ranger", 
+             metric    = "Accuracy",
+             importance = 'impurity',
+             num.trees = 200,
+             tuneGrid = rf.grid,
+             trControl = trainControl,
+             verbose = TRUE
+            )
+
+toc()
+
+validation.fit_r3 <- predict(fit_r3, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_r3)
+
+varImp(fit_r3)
+
+
+
+```
+
+
+
+```{r}
+set.seed(1234)
+my_train_l <- copy(my_train3)
+my_test_l <- copy(my_test3)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+n.folds <- 10
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                             repeats=3
+                            )
+
+rf.grid<-expand.grid( mtry =  c(fit_r1$mtry, 10, 15,20),              
+              splitrule  = 'gini',
+             min.node.size = c(fit_r1$min.node.size,10,20)
+ 
+ )
+
+tic()
+set.seed(1234)
+fit_r4 <- train( 
+             status_group ~., 
+             data      = my_train_l, 
+             method    = "ranger", 
+             metric    = "Accuracy",
+             importance = 'impurity',
+             num.trees = 300,
+             tuneGrid = rf.grid,
+             trControl = trainControl,
+             verbose = TRUE
+            )
+
+toc()
+
+validation.fit_r4 <- predict(fit_r4, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_r4)
+
+varImp(fit_r4)
+
+
+
+```
+
+
+```{r}
+predict_x3 <- copy(predict_x2_num)
+predict_x3$fe_lonlat  <- sqrt(predict_x3$longitude^2 + predict_x3$latitude^2)
+
+# pequeña imputación en una observación, a la label más cercana
+predict_x3$fe_anio2[predict_x3$fe_anio2 == "2001"] <- "2002"
+
+predictions <- predict(fit_r4, newdata = predict_x3)
+
+levels(predictions) <- levels(file.prediction.fit_r1$status_group)
+
+file.prediction.fit_r4 <- cbind.data.frame(test_id, predictions)
+
+colnames(file.prediction.fit_r4) <- c("id","status_group")
+
+
+fwrite(file.prediction.fit_r4, file ="predi_fit_r4.csv",sep=)
+```
+
+
+```{r}
+fit_r3$finalModel
+fit_r4$finalModel
+
+
+```
+
+
+## - Iteración 6
+ 
+Grid search del segundo conjunto, que presentaba un tratamiendo de outliers en algunas variables numéricas así como un lumping extra para algunas variables catégoricas. En este caso se toma como punto de partida los valores altos de mtry y número de arboles de la iteración anterior. Uso de stratifiedKfold con repeticion. La accuracy de validación es de 0.8073, todavía inferior al mejor modelo obtenido. El mtry óptimo ha sido un valor central del mallado por lo que no se sigue explorando con valores superiores.
+
+```{r}
+
+datMod4 <- copy(datMod2)
+
+datMod4$fe_lonlat  <- sqrt(datMod4$longitude^2 + datMod4$latitude^2)
+
+set.seed(1234)
+validationIndex <- createDataPartition(datMod$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test4  <- datMod4[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train4 <- datMod4[validationIndex,]
+
+set.seed(1234)
+my_train_l <- copy(my_train4)
+my_test_l <- copy(my_test4)
+
+# Caret no aceptaba los factores originales
+levels(my_train_l$status_group) <- c('f','fnr','nf')
+levels(my_test_l$status_group) <- c('f','fnr','nf')
+
+n.folds <- 10
+cvIndex <- createFolds(factor(my_train_l$status_group), n.folds, returnTrain = T)
+
+
+trainControl <- trainControl(index = cvIndex,
+                             method = "cv", 
+                             number = n.folds,
+                             classProbs = TRUE,
+                             repeats=3
+                            )
+
+rf.grid<-expand.grid( mtry =  c(20, 25,30),              
+              splitrule  = 'gini',
+             min.node.size = c(fit_r1$min.node.size)
+ 
+ )
+
+tic()
+set.seed(1234)
+fit_r6 <- train( 
+             status_group ~., 
+             data      = my_train_l, 
+             method    = "ranger", 
+             metric    = "Accuracy",
+             importance = 'impurity',
+             num.trees = 300,
+             tuneGrid = rf.grid,
+             trControl = trainControl,
+             verbose = TRUE
+            )
+
+toc()
+
+validation.fit_r6 <- predict(fit_r6, newdata = my_test_l)
+confusionMatrix( my_test_l$status_group, validation.fit_r6)
+
+varImp(fit_r6)
+
+
+
+```
+
+
+```{r}
+ fit_r6$finalModel
+```
+
+## - Iteración 7
+
+Viendo que las accuracies obtenidas siguen siendo más bajas al modelo óptimo y teniendo en cuenta el deadline cercano, se procede a probar a cambiar los hiperparámetros del mejor modelo, ranger sin remuestreo con el conjunto datMod, con aquellos valores de los hiperparámetros obtenidos de la iteración 6.
+
+
+Se prueban dos conjuntos de variables del original de la iteración 1 (datMod) ampliado con fe_lonlat y con el datMod prístino. Las accuracies obtenidas son similares al óptimo pero algo por debajo, 0.8001 y 0.8043 respectivamente.
+
+
+```{r}
+# registerDoMC(2)
+
+datMod5 <- copy(datMod)
+
+datMod5$fe_lonlat  <- sqrt(datMod5$longitude^2 + datMod5$latitude^2)
+
+# Split out validation dataset
+# create a list of 80% of the rows in the original dataset we can use for training
+set.seed(1234)
+validationIndex <- createDataPartition(datMod5$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test  <- datMod5[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train <- datMod5[validationIndex,]
+
+tic()
+set.seed(1234)
+fit_r7 <- ranger(
+               status_group ~. , 
+               data = my_train,
+               num.trees = 300,
+               mtry=25,
+               importance = 'impurity',
+               write.forest = TRUE,
+               min.node.size = 1,
+               splitrule = "gini",
+               verbose = TRUE,
+               classification = TRUE
+             )
+
+toc()
+
+
+validation.fit_r7 <- predict(fit_r7, data = my_test)
+confusionMatrix( my_test$status_group, validation.fit_r7$predictions)
+
+```
+
+
+```{r}
+# registerDoMC(2)
+
+
+# Split out validation dataset
+# create a list of 80% of the rows in the original dataset we can use for training
+set.seed(1234)
+validationIndex <- createDataPartition(datMod$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test  <- datMod[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train <- datMod[validationIndex,]
+
+tic()
+set.seed(1234)
+fit_r8 <- ranger(
+               status_group ~. , 
+               data = my_train,
+               num.trees = 300,
+               mtry=25,
+               importance = 'impurity',
+               write.forest = TRUE,
+               min.node.size = 1,
+               splitrule = "gini",
+               verbose = TRUE,
+               classification = TRUE
+             )
+
+toc()
+
+
+validation.fit_r8 <- predict(fit_r8, data = my_test)
+confusionMatrix( my_test$status_group, validation.fit_r8$predictions)
+
+```
+
+
+## - Iteración 8
+
+
+Hata ahora el mejor valor de la accuracy ha sido con el primer modelo de la iteración 1. A modo de concluir este primer análisis del problema, se procede a hacer una optimización local (valores de los hiperparámetros cercanos a ese óptimo).
+
+
+Se logra una una accuracy muy similar en el conjunto de validación 0.8099, **que da lugar a una pequeña mejora el conjunto test consiguiendo un 0.8173**.
+
+```{r}
+
+set.seed(1234)
+validationIndex <- createDataPartition(datMod$status_group, p=0.80, list=FALSE)
+
+# select 20% of the data for validation
+my_test  <- datMod[-validationIndex,]
+# use the remaining 80% of data to training and testing the 
+my_train <- datMod[validationIndex,]
+
+rf.grid<-expand.grid( mtry =  c(5,6,7),              
+             min.node.size = c(1,2,3),
+             num.trees =c(100,150)
+             
+)
+
+tic()
+results <- c()
+
+for (i in 1:nrow(rf.grid))
+  
+  
+{
+
+
+set.seed(1234)
+
+fit_r9 <- ranger(
+               status_group ~. , 
+               data = my_train,
+               mtry= rf.grid[i, 1],
+               num.trees = rf.grid[i, 3],
+               importance = 'impurity',
+               write.forest = TRUE,
+               min.node.size = rf.grid[i, 2],
+               splitrule = "gini",
+               verbose = TRUE,
+            
+               classification = TRUE
+             )
+validation.fit_r9 <- predict(fit_r9, data = my_test)
+accuracy <-confusionMatrix( my_test$status_group, validation.fit_r9$predictions)
+
+results <- append(results,c(accuracy$overall[1],i))
+
+}
+
+toc()
+
+results
+
+```
+
+
+El siguiente es el mejor modelo obtenido.
+
+```{r, eval=TRUE}
+
+rf.grid<-expand.grid( mtry =  c(5,6,7),              
+             min.node.size = c(1,2,3),
+             num.trees =c(100,150))
+
+i =8
+set.seed(1234)
+
+fit_r9 <- ranger(
+               status_group ~. , 
+               data = my_train,
+               mtry= rf.grid[i, 1],
+               num.trees = rf.grid[i, 3],
+               importance = 'impurity',
+               write.forest = TRUE,
+               min.node.size = rf.grid[i, 2],
+               splitrule = "gini",
+               verbose = TRUE,
+            
+               classification = TRUE
+             )
+validation.fit_r9 <- predict(fit_r9, data = my_test)
+confusionMatrix( my_test$status_group, validation.fit_r9$predictions)
+
+prediction.fit_r9 <- predict(fit_r9, data = predict_x)
+file.prediction.fit_r9 <- cbind.data.frame(test_id, prediction.fit_r9$predictions)
+colnames(file.prediction.fit_r9) <- c("id","status_group")
+fwrite(file.prediction.fit_r9, file ="predi_fit_r9.csv",sep=)
+
+
+```
+
+
+## - Resultados
+
+A continuación se muestran las puntuaciones logradas en el concurso, situando al modelo óptimo encontrado cerca del top 10%.
+
+
+![Resultados obtenidos en conjunto test](./fig1.png)
+
+
+![Clasificación en el concurso](./fig2.png)
+
+
+# - Conclusiones
+
+Se ha seguido un esquema iterativo atendiendo al paradigma de ramificación y poda, debido a las restricciones de tiempo y capacidad de computación.
+
+En la primera iteración se presenta el conjunto transformado, datMod, que servirá como base al de las iteraciones 2 y 3. En estas tres iteraciones se evalúan randon forest (en su variante implementación ranger) y gbm, con parámetros 'típicos' sin hacer grid search. Se concluye que ranger da lugar a mejores resultados más rápido para las configuraciones evaluadas en este problema.
+
+En la iteración 4 se evalúa xgboost y se vuelve a concluir que ranger presenta mejores resultados más rápido. Por lo que, por motivos de tiempo, sólo se hacen modelos con algoritmo ranger.
+
+Con estos resultados parciales, se analiza la importancia de las variables y se crea una nueva fe_lonlat. Se hace un grid search no fino en las iteraciones 5 y 6 para los conjuntos de las iteraciones 2 y 3, ya que presentan mejores accuracies que la iteración 1 con remuestreo. Las accuracies mejoran pero no superan al modelo de ranger sin remuestreo de la iteración 1.
+
+
+Viendo que el modelo óptimo sigue siendo el ranger sin remuestreo de la iteración 1, y teniendo en cuenta el cercano deadline, se vueve a ese modelo en la iteración 7, probando con los valores de los hiperparámetros obtenidos en las iteraciones 5 y 6. Los resultados en al accuracy siguen por debajo del mejor modelo.
+
+
+Finalmente, se prueba una optimización local de este mejor modelo, mejorando la predicción del test unas centésimas en la iteración 8.
+
+
+
+Dos conclusiones se extraen de este primer análisis del problema.
+
+- Importancia del feature engineering. Con las transformaciones de variables adecuadas, algoritmos no tan punteros como el random forest - xgboost es el dominante en Kaggle -   pueden lograr buenos resultados, como se observa en los resultados de esta clasificación multinomial. Unas transformaciones resultarán beneficiosas para ciertos algoritmos y perniciosas para otros.
+
+- A veces menos es más. En este problema con propensión al overfitting por el alto número categorías una simple partición train-validation ha logrado mejores resultados que el stratifiedKfolds. 
+
+
+Estas dos conclusiones evidencian - de forma no robusta -  la no trivialidad de la Ciencia de Datos y como los métodos más usados no siempre tienen por qué ser los óptimos.
+
+
+
