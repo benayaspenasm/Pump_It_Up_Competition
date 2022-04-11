@@ -1,6 +1,8 @@
 Multi-label classification problem on the state of water pumps (Spanish)
 
-10-day analysis that led to be ranked as 1577 out of the 12577 competitors on Kaggle 
+10-day analysis that led to be ranked as 1577 out of the 12577 competitors on https://www.drivendata.org/
+
+pdf attached but best visualization is on the html file.
 
 SCRUM methodology, Exploratory Data Analysis, Data Cleaning
 
